@@ -1,0 +1,58 @@
+name: Build Yamada OBright
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [ published ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28c
+          link-to-sdk: false
+
+      - name: Build
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Verify ELF (arch + 16 KB page alignment)
+        run: |
+          BIN="out/vendor/bin/hw/yamada.obright-V1@3.0-service"
+          file "$BIN"
+          readelf -lW "$BIN" | grep LOAD
+          # every LOAD segment must have Align >= 0x4000
+          if readelf -lW "$BIN" | awk '/LOAD/ {print $NF}' | grep -qE '^0x1000$'; then
+            echo "::error::4 KB aligned segment found, not 16 KB safe"; exit 1
+          fi
+
+      - name: Package
+        run: |
+          cd out
+          zip -r ../yamada-obright-ruby.zip vendor
+          sha256sum ../yamada-obright-ruby.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yamada-obright-ruby
+          path: |
+            yamada-obright-ruby.zip
+            out/vendor/**
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: yamada-obright-ruby.zip

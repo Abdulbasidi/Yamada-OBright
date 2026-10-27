@@ -11,6 +11,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Source
     steps:
       - uses: actions/checkout@v4
 
@@ -25,6 +28,7 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
+          ls -la
           chmod +x build.sh
           ./build.sh
 
@@ -33,7 +37,6 @@ jobs:
           BIN="out/vendor/bin/hw/yamada.obright-V1@3.0-service"
           file "$BIN"
           readelf -lW "$BIN" | grep LOAD
-          # every LOAD segment must have Align >= 0x4000
           if readelf -lW "$BIN" | awk '/LOAD/ {print $NF}' | grep -qE '^0x1000$'; then
             echo "::error::4 KB aligned segment found, not 16 KB safe"; exit 1
           fi
@@ -48,11 +51,11 @@ jobs:
         with:
           name: yamada-obright-ruby
           path: |
-            yamada-obright-ruby.zip
-            out/vendor/**
+            Source/yamada-obright-ruby.zip
+            Source/out/vendor/**
 
       - name: Attach to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: yamada-obright-ruby.zip
+          files: Source/yamada-obright-ruby.zip

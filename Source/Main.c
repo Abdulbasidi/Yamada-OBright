@@ -19,9 +19,11 @@
 #define STATE_PROP "debug.tracing.screen_state"
 #define LOG_TAG    "YamadaOBright"
 
-// Framework brightness source on A17: logcat line from LocalDisplayDeviceExtImpl, e.g.
-//   setDisplayBrightness(... level[4570.0, 4570.0], nit[...], ...)
-#define LOGCAT_CMD "logcat -b system -v brief -T 1 LocalDisplayDeviceExtImpl:D '*:S' 2>/dev/null"
+// Framework brightness source on A17 (logged on EVERY change, 0..8191 scale):
+//   DpcExtImpl[display=0]: Animating brightness: hdrBrightness target=A->B,sdrBrightness target=A->B,...
+// (LocalDisplayDeviceExtImpl.setDisplayBrightness is only logged early after boot, so it is not used.)
+#define LOGCAT_CMD  "logcat -b system -b main -v brief -T 1 -e 'Animating brightness' 2>/dev/null"
+#define LOGCAT_INIT "logcat -b system -b main -d -v brief -e 'Animating brightness' 2>/dev/null"
 
 static const char* BL_DIRS[] = {
     "/sys/class/leds/lcd-backlight",
@@ -32,7 +34,14 @@ static const char* BL_DIRS[] = {
 #define DEFAULT_HW_MAX   2047
 #define REF_SCALE        4095
 #define FLOOR_OFFSET_REF 100
-#define AOD_MIN_REF      400
+// AOD brightness is derived from the current (auto) brightness level, so it follows
+// ambient light: aod = level * pct / 100, clamped to [min, max] (values on the 4095 scale).
+// Live tuning (root):  setprop persist.yamada.aod.percent 25
+//                      setprop persist.yamada.aod.min 80
+//                      setprop persist.yamada.aod.max 400
+#define AOD_PCT_DEF      25
+#define AOD_MIN_DEF_REF  80
+#define AOD_MAX_DEF_REF  400
 
 static int g_evfd = -1;
 
@@ -55,6 +64,28 @@ static int get_screen_state(void) {
     char value[PROP_VALUE_MAX];
     if (__system_property_get(STATE_PROP, value) > 0) return atoi(value);
     return 2;
+}
+
+static int get_int_prop(const char* name, int def) {
+    char value[PROP_VALUE_MAX];
+    if (__system_property_get(name, value) > 0) return atoi(value);
+    return def;
+}
+
+static int aod_brightness(int level, int hw_min, int hw_max) {
+    int pct  = get_int_prop("persist.yamada.aod.percent", AOD_PCT_DEF);
+    int amin = get_int_prop("persist.yamada.aod.min", (AOD_MIN_DEF_REF * hw_max) / REF_SCALE);
+    int amax = get_int_prop("persist.yamada.aod.max", (AOD_MAX_DEF_REF * hw_max) / REF_SCALE);
+    if (pct < 1) pct = 1;
+    if (pct > 100) pct = 100;
+    if (amin < 1) amin = 1;
+    if (amax > hw_max) amax = hw_max;
+    if (amax < amin) amax = amin;
+    int v = (int)(((long)level * pct) / 100);
+    (void)hw_min;
+    if (v < amin) v = amin;
+    if (v > amax) v = amax;
+    return v;
 }
 
 static int open_backlight(const char* dir) {
@@ -115,15 +146,30 @@ static void logcat_close(void) {
 
 // Returns true if a new level was parsed into *level
 static bool parse_line(const char* line, float* level) {
-    if (!strstr(line, "setDisplayBrightness(")) return false;
-    const char* p = strstr(line, "level[");
+    const char* p = strstr(line, "sdrBrightness target=");
     if (!p) return false;
-    p += 6;
+    p = strstr(p, "->");
+    if (!p) return false;
+    p += 2;
     char* end = NULL;
     float v = strtof(p, &end);
-    if (end == p) return false;
+    if (end == p || v <= 0.0f) return false;   // ignore -1 / 0 (screen off)
     *level = v;
     return true;
+}
+
+// One-shot: last known level from the existing log buffer
+static float logcat_initial_level(void) {
+    float level = 0.0f;
+    FILE* f = popen(LOGCAT_INIT, "r");
+    if (!f) return level;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        float v;
+        if (parse_line(line, &v)) level = v;
+    }
+    pclose(f);
+    return level;
 }
 
 static bool logcat_pump(int fd, float* level) {
@@ -154,7 +200,7 @@ static long now_ms(void) {
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Starting Yamada OBright (ruby, logcat source)");
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Starting Yamada OBright (ruby, DpcExtImpl logcat source)");
 
     const char* dir = BL_DIRS[0];
     for (int i = 0; BL_DIRS[i]; i++) {
@@ -177,10 +223,9 @@ int main(void) {
 
     hw_min += (FLOOR_OFFSET_REF * hw_max) / REF_SCALE;
     if (hw_min >= hw_max) hw_min = hw_max / 20 + 1;
-    int aod_min = (AOD_MIN_REF * hw_max) / REF_SCALE;
 
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
-        "dir=%s hw_min=%d hw_max=%d in=[%d..%d] aod_min=%d", dir, hw_min, hw_max, input_min, input_max, aod_min);
+        "dir=%s hw_min=%d hw_max=%d in=[%d..%d]", dir, hw_min, hw_max, input_min, input_max);
 
     int fd = open_backlight(dir);
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "open backlight fd=%d errno=%d", fd, fd < 0 ? errno : 0);
@@ -192,7 +237,8 @@ int main(void) {
     int lcfd = logcat_open();
     long last_lc_try = now_ms();
 
-    float log_level = 0.0f;      // from logcat
+    float log_level = logcat_initial_level();      // from logcat
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "initial level from logcat=%.1f", log_level);
     float cur_prop = 0.0f;       // effective input level
     int prev_state = get_screen_state();
     int prev_bright = hw_min;
@@ -261,7 +307,7 @@ int main(void) {
 
         int val;
         if (cur_state == 1 || cur_state == 0) val = 0;
-        else if (cur_state == 3 || cur_state == 4) val = (cur_bright < aod_min) ? aod_min : cur_bright;
+        else if (cur_state == 3 || cur_state == 4) val = aod_brightness(cur_bright, hw_min, hw_max);
         else val = cur_bright;
         if (val > hw_max) val = hw_max;
 

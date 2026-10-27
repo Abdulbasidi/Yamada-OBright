@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <math.h>
@@ -8,191 +9,169 @@
 #include <sys/system_properties.h>
 #include <android/log.h>
 
-#define PROP_NAME "debug.tracing.screen_brightness"
+#define PROP_NAME  "debug.tracing.screen_brightness"
 #define STATE_PROP "debug.tracing.screen_state"
-#define BACKLIGHT_PATH "/sys/class/leds/lcd-backlight/brightness"
-#define MAX_BRIGHT_PATH "/sys/class/leds/lcd-backlight/max_hw_brightness"
-#define MIN_BRIGHT_PATH "/sys/class/leds/lcd-backlight/min_brightness"
-#define LOG_TAG "YamadaOBright"
+#define LOG_TAG    "YamadaOBright"
 
-// --- Input Bounds ---
-// These will now be read dynamically from system properties.
+// ---- ruby (MT6877, Redmi Note 12 Pro 5G) ----
+// MTK exposes the backlight as a LED class device. Candidates are tried in order.
+static const char* BL_DIRS[] = {
+    "/sys/class/leds/lcd-backlight",
+    "/sys/class/backlight/panel0-backlight",
+    "/sys/class/leds/lcd-backlight-1",
+    NULL
+};
+#define DEFAULT_HW_MAX   2047   // MTK default; overridden by sysfs if readable
+#define REF_SCALE        4095   // scale the original constants were tuned for (100 floor, 400 AOD)
+#define FLOOR_OFFSET_REF 100
+#define AOD_MIN_REF      400
 
-
-// --- File Reading Helpers ---
-int read_int_from_file(const char* path, int default_val) {
+static int read_int_from_file(const char* path, int def) {
     FILE* f = fopen(path, "r");
-    if (!f) return default_val;
-    int val = default_val;
-    if (fscanf(f, "%d", &val) != 1) {
-        val = default_val;
-    }
+    if (!f) return def;
+    int v = def;
+    if (fscanf(f, "%d", &v) != 1) v = def;
     fclose(f);
-    return val;
+    return v;
 }
 
-void write_backlight_fd(int fd, int brightness_val) {
+static int file_exists(const char* p) { return access(p, F_OK) == 0; }
+
+static float get_float_prop(const char* name, float def) {
+    char value[PROP_VALUE_MAX];
+    if (__system_property_get(name, value) > 0) return atof(value);
+    return def;
+}
+
+static int get_screen_state(void) {
+    char value[PROP_VALUE_MAX];
+    if (__system_property_get(STATE_PROP, value) > 0) return atoi(value);
+    return 2;
+}
+
+static int open_backlight(const char* dir) {
+    char path[160];
+    snprintf(path, sizeof(path), "%s/brightness", dir);
+    return open(path, O_WRONLY);
+}
+
+static void write_backlight_fd(int fd, int v) {
     if (fd < 0) return;
     char buf[32];
-    int len = snprintf(buf, sizeof(buf), "%d\n", brightness_val);
+    int len = snprintf(buf, sizeof(buf), "%d\n", v);
     pwrite(fd, buf, len, 0);
 }
 
-// --- Property Reading Helpers ---
-float get_float_prop(const char* prop_name, float default_val) {
-    char value[PROP_VALUE_MAX];
-    if (__system_property_get(prop_name, value) > 0) {
-        return atof(value);
+static int calculate_brightness(float p, int hw_min, int hw_max, int in_min, int in_max) {
+    if (in_max <= in_min) return hw_min;
+    if (p < in_min) p = in_min;
+    if (p > in_max) p = in_max;
+    float n = (p - in_min) / (float)(in_max - in_min);
+    float curved = powf(n, 2.2f);
+    return hw_min + (int)roundf(curved * (float)(hw_max - hw_min));
+}
+
+int main(void) {
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Starting Yamada OBright (ruby)");
+
+    // Pick backlight dir
+    const char* dir = BL_DIRS[0];
+    for (int i = 0; BL_DIRS[i]; i++) {
+        char p[160];
+        snprintf(p, sizeof(p), "%s/brightness", BL_DIRS[i]);
+        if (file_exists(p)) { dir = BL_DIRS[i]; break; }
     }
-    return default_val;
-}
 
-int get_screen_state() {
-    char value[PROP_VALUE_MAX];
-    if (__system_property_get(STATE_PROP, value) > 0) {
-        return atoi(value);
+    char p[160];
+    snprintf(p, sizeof(p), "%s/max_hw_brightness", dir);
+    int hw_max = file_exists(p) ? read_int_from_file(p, 0) : 0;
+    if (hw_max <= 0) {
+        snprintf(p, sizeof(p), "%s/max_brightness", dir);
+        hw_max = read_int_from_file(p, DEFAULT_HW_MAX);
     }
-    return 2; // Default to ON (2)
-}
+    snprintf(p, sizeof(p), "%s/min_brightness", dir);
+    int hw_min = read_int_from_file(p, 1);
 
-// --- Math Translation ---
-int calculate_brightness(float prop_val, int hw_min, int hw_max, int input_min, int input_max) {
-    float f_input_min = (float)input_min;
-    float f_input_max = (float)input_max;
-
-    // Constrain prop_val to bounds
-    if (prop_val < f_input_min) prop_val = f_input_min;
-    if (prop_val > f_input_max) prop_val = f_input_max;
-
-    // Normalize input to a 0.0 - 1.0 range based on the dynamic bounds
-    float normalized_input = (prop_val - f_input_min) / (f_input_max - f_input_min);
-
-    // Apply standard human eye brightness perception curve (gamma 2.2)
-    // The previous cbrtf (cube root) was making it drastically too bright at low levels!
-    float curved = powf(normalized_input, 2.2f);
-
-    // Map the curved percentage to the physical hardware bounds
-    int result = hw_min + (int)roundf(curved * (float)(hw_max - hw_min));
-    
-    return result;
-}
-
-// --- Main Daemon ---
-int main() {
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Starting Yamada OPlus Display Adaptor (Anti-Cache Edition)...");
-
-    int hw_max = read_int_from_file(MAX_BRIGHT_PATH, 4095);
-    int hw_min = read_int_from_file(MIN_BRIGHT_PATH, 1);    
     int input_max = (int)get_float_prop("sys.oplus.multibrightness", 8191.0f);
     int input_min = (int)get_float_prop("sys.oplus.multibrightness.min", 222.0f);
 
-    // [BUG FIX]: As requested, use exactly 100 + min_brightness for the physical floor.
-    // This gives a controlled, very dim low end without blacking out.
-    int safe_hw_min = 100 + hw_min;
-    if (hw_min < safe_hw_min) {
-        hw_min = safe_hw_min;
-    }
-    
-    int backlight_fd = open(BACKLIGHT_PATH, O_WRONLY);
-    if (backlight_fd < 0) {
-        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Failed to open backlight path!");
-    }
+    // Floor/AOD scaled from the 4095-range values to the real hw range
+    hw_min += (FLOOR_OFFSET_REF * hw_max) / REF_SCALE;
+    if (hw_min >= hw_max) hw_min = hw_max / 20 + 1;
+    int aod_min = (AOD_MIN_REF * hw_max) / REF_SCALE;
 
-    uint32_t global_serial = 0;
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+        "dir=%s hw_min=%d hw_max=%d in=[%d..%d] aod_min=%d", dir, hw_min, hw_max, input_min, input_max, aod_min);
+
+    int fd = open_backlight(dir);
+    if (fd < 0) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "open backlight failed, will retry");
+
+    uint32_t serial = 0;
     struct timespec no_wait = {0, 0};
-    __system_property_wait(NULL, 0, &global_serial, &no_wait); 
+    __system_property_wait(NULL, 0, &serial, &no_wait);
 
-    float current_prop_val = get_float_prop(PROP_NAME, 0.0f);
+    float cur_prop = get_float_prop(PROP_NAME, 0.0f);
     int prev_state = get_screen_state();
-    
-    // Calculate initial brightness using the dynamic bounds
-    int raw_initial = (current_prop_val == 0.0f) ? -1 : calculate_brightness(current_prop_val, hw_min, hw_max, input_min, input_max);
-    int prev_bright = (raw_initial == -1) ? hw_min : raw_initial;
-    
-    // Safety net: ensure even initialization respects the dynamic floor
-    if (prev_bright < hw_min) prev_bright = hw_min; 
-    
-    int last_written_val = -1;
+    int prev_bright = (cur_prop == 0.0f) ? hw_min
+                    : calculate_brightness(cur_prop, hw_min, hw_max, input_min, input_max);
+    if (prev_bright < hw_min) prev_bright = hw_min;
+    if (prev_bright > hw_max) prev_bright = hw_max;
+
+    int last_written = -1;
     int wake_ticks = 0;
 
-    if (prev_state == 1 || prev_state == 0) {
-        last_written_val = 0;
-        write_backlight_fd(backlight_fd, 0);
-    } else {
-        last_written_val = prev_bright;
-        write_backlight_fd(backlight_fd, prev_bright);
-    }
-
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Entering Smart Timeout Event Loop.");
+    if (prev_state == 1 || prev_state == 0) last_written = 0;
+    else last_written = prev_bright;
+    write_backlight_fd(fd, last_written);
 
     for (;;) {
-        uint32_t old_serial = global_serial;
-
-        // 1. Smart Waiting
+        uint32_t old = serial;
         if (wake_ticks > 0) {
-            struct timespec timeout = {0, 50000000}; // 50ms
-            __system_property_wait(NULL, old_serial, &global_serial, &timeout);
+            struct timespec t = {0, 50000000};
+            __system_property_wait(NULL, old, &serial, &t);
         } else {
-            __system_property_wait(NULL, old_serial, &global_serial, NULL);
+            __system_property_wait(NULL, old, &serial, NULL);
         }
 
-        bool props_changed = (global_serial != old_serial);
-        
-        float new_prop_val = current_prop_val;
+        // retry open if it failed at start (e.g. perms not ready yet)
+        if (fd < 0) fd = open_backlight(dir);
+
+        bool changed = (serial != old);
+        float new_prop = cur_prop;
         int cur_state = prev_state;
         int cur_bright = prev_bright;
 
-        if (props_changed) {
-            // 2. Read Fresh Data
-            new_prop_val = get_float_prop(PROP_NAME, current_prop_val);
+        if (changed) {
+            new_prop = get_float_prop(PROP_NAME, cur_prop);
             cur_state = get_screen_state();
-
-            // Calculate new brightness using the dynamic bounds
-            int raw_bright = (new_prop_val == 0.0f) ? -1 : calculate_brightness(new_prop_val, hw_min, hw_max, input_min, input_max);
-            cur_bright = (raw_bright == -1) ? prev_bright : raw_bright;
-            
-            // [BUG FIX]: Absolute safety check. Nothing evaluates below hw_min when ON.
-            if (cur_bright < hw_min) cur_bright = hw_min; 
+            if (new_prop != 0.0f)
+                cur_bright = calculate_brightness(new_prop, hw_min, hw_max, input_min, input_max);
+            if (cur_bright < hw_min) cur_bright = hw_min;
+            if (cur_bright > hw_max) cur_bright = hw_max;
         }
 
-        // 3. State Change Detection
-        if (cur_state != prev_state) {
-            if (cur_state == 2 || cur_state == 3 || cur_state == 4) {
-                wake_ticks = 15; 
-            } else {
-                wake_ticks = 0;  
-            }
-        }
+        if (cur_state != prev_state)
+            wake_ticks = (cur_state == 2 || cur_state == 3 || cur_state == 4) ? 15 : 0;
 
-        // 4. Calculate Final Value
-        int val_to_write = 0;
-        if (cur_state == 1 || cur_state == 0) {
-            val_to_write = 0;
-        } else if (cur_state == 3 || cur_state == 4) {
-            val_to_write = (cur_bright < 400) ? 400 : cur_bright; // Force AOD visibility
-        } else {
-            val_to_write = cur_bright;
-        }
+        int val;
+        if (cur_state == 1 || cur_state == 0) val = 0;
+        else if (cur_state == 3 || cur_state == 4) val = (cur_bright < aod_min) ? aod_min : cur_bright;
+        else val = cur_bright;
+        if (val > hw_max) val = hw_max;
 
-        // 5. Execution Logic
-        if (val_to_write != last_written_val) {
-            write_backlight_fd(backlight_fd, val_to_write);
-            last_written_val = val_to_write;
-            
-        } else if (wake_ticks > 0 && (cur_state == 2 || cur_state == 3 || cur_state == 4) && !props_changed) {
-            // The Anti-Cache Wobble
+        if (val != last_written) {
+            write_backlight_fd(fd, val);
+            last_written = val;
+        } else if (wake_ticks > 0 && (cur_state >= 2 && cur_state <= 4) && !changed) {
             wake_ticks--;
-            int wobble = (val_to_write > hw_min) ? val_to_write - 1 : val_to_write + 1;
-            
-            write_backlight_fd(backlight_fd, wobble);
-            write_backlight_fd(backlight_fd, val_to_write);
+            int wobble = (val > hw_min) ? val - 1 : val + 1;
+            write_backlight_fd(fd, wobble);
+            write_backlight_fd(fd, val);
         }
 
         prev_bright = cur_bright;
         prev_state = cur_state;
-        current_prop_val = new_prop_val;
+        cur_prop = new_prop;
     }
-
-    if (backlight_fd >= 0) close(backlight_fd); 
     return 0;
 }
